@@ -144,3 +144,40 @@ make PLATFORM=moore
 ## 有疑问？
 
 可以在群里直接询问助教。
+
+## 已修复的环境问题
+
+### 1. `make clean` 之后的运行时 PTX 工具链错误
+
+仓库自带的 `tester/tester_nv.o` 在打包时仅嵌入了 `sm_52` SASS + `PTX 8.5`（toolkit 126，CUDA 11.x 系列），
+但 host 代码引用了 CUDA 12.x 才有的 `cudaGetDeviceProperties_v2` 符号。在搭配驱动
+535.x（CUDA 12.2 runtime）的 RTX 30/40 系列（sm_86/89）上时，运行测试会出现：
+
+```text
+Runtime error at tester/tester_nv.cu:635 - the provided PTX was compiled with an unsupported toolchain.
+```
+
+**修复**：在保持原 host code/reloc 不变的前提下，把 `.nv_fatbin` 段替换为基于原 PTX 重新编译的
+`sm_86` SASS 新 fatbin（用 `cuobjdump --dump-ptx` 抽出 PTX，再用 CUDA 12.8 的 `nvcc -cubin -arch=sm_86`
+重编后用 `fatbinary` 打包）。同时把 `Makefile` 默认工具链固定为
+`/usr/local/cuda-12.2`（`tester_nv.o` 引用的 cudart 12.x 符号需要 CUDA 12.x 链接器；`Makefile`
+中的 `NVCC_DIR` 可被 `make NVCC_DIR=...` 覆盖）。`make clean` 之后直接 `make` 即可跑通。
+
+### 2. CUDA 工具链选择
+
+`Makefile` 通过 `NVCC_DIR` 变量显式选择工具链，**不** 读取 shell 的 `CUDA_HOME`，避免被
+`/usr/local/cuda-12.2` 之类的环境默认值带偏。若本机 CUDA 路径不同，可用：
+
+```bash
+make NVCC_DIR=/usr/local/cuda-12.8
+```
+
+### 3. 默认 GPU 架构（SM_ARCH）
+
+`Makefile` 在 NVIDIA 分支会显式给 `nvcc` 加上 `-arch=sm_86`，让 student kernel
+在 RTX 30/40 系列（sm_86/sm_89）上原生运行。`nvcc` 默认会选 `sm_52`（兼容性最好），
+但在 Ampere 上要靠 driver JIT 解释 sm_52 SASS，性能差 10x 左右，且 flashAttention
+的 dot-product 测试 #6 / #14 float 会因 JIT 改写后的浮点路径而跑出容差带（差 1.2-1.6×）。
+若你的 GPU 不是 RTX 30/40 系列，可用 `make SM_ARCH=sm_89`（RTX 4090）/ `sm_80`（A100）
+之类显式指定。
+测试全部通过（NVIDIA）
