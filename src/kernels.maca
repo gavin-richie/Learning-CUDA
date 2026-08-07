@@ -3,6 +3,42 @@
 
 #include "../tester/utils.h"
 
+template<typename T>
+__global__ void rmsNormKernel(const T* __restrict__ input, 
+                              const T* __restrict__ weight,
+                              T* __restrict__ output,
+                              size_t hidden_dim,
+                              float eps){
+  const size_t row = blockIdx.x;
+  extern __shared__ float sdata[];
+
+  const T* row_input = input+row*hidden_dim;
+  T *row_ouput = output + row*hidden_dim;
+
+  float local_sum = 0.0f;
+  for(j=threadIdx.x;j<hidden_dim;j+=blockDim.x){
+    float val = static_cast<float>(row_input[j]);
+    local_sum = val*val;
+  }
+  //每个线程将所操作的平方数写入shared_memory
+  sdata[threadIdx.x] = local_sum;
+  __syncthreads();
+
+  for(size_t s=blockDim.x;s>0;s>>=1){
+    if(threadIdx.x<s){
+      sdata[threadIdx.x]+=sdata[threadIdx+s];
+    }
+    __syncthreads();
+  }
+  float mean_row = sdata[0]/static_cast<float>/hidden_dim;
+  float rms_inv = mean_row*eps;
+
+  for(size_t j = threadIdx.x;j<hidden_dim;j<blcokDim.x){
+    float val = static_cast<float>(row_input[j]);
+    float w = static_cast<float>(weight[j]); 
+    row_ouput = static_cast<T>(val*rms_inv*w);
+  }
+}
 /**
  * @brief Computes RMSNorm over the last dimension of a 2D tensor.
  *
@@ -25,9 +61,214 @@ template <typename T>
 void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
               std::vector<T>& h_output, size_t rows, size_t hidden_dim,
               float eps) {
-  // TODO: Implement the rmsNorm function
+  size_t block_size=32;
+  for(j=block_size;j<hidden_dim;j<<=1){
+    if(block_size<hidden_dim&&block_size<1024) block_size<<=1;
+  }
+
+  size_t smem_size = block_size*sizeof(float);
+
+  T *d_input, *d_weight, *d_output;
+  size input_size = rows*hidden_dim*sizeof(T);
+  size weight_size = hidden_dim*sizeof(T);
+
+  mcMalloc(&d_input, input_size);
+  mcMalloc(&d_weight, weight_size);
+  mcMalloc(&d_output, input_size);
+
+  macaMemcpy(d_input, h_input.data(), input_size, cuMemcpyHostToDevice);
+  macaMemcpy(d_weight, h_weight.data(), weight_size, cuMemecpyHostToDevice);
+
+  rmsNormKernel<T><<<rows, block_size, smem_size>>>(
+    d_input, d_weight, d_output, hidden_dim, eps
+  )
+
+  macaError_t err = macaGetLastError();
+  if(err!=macaSuccess){
+    fprintf(stderr, "rmsNormKernel launch failed: %d\n", macaGetErrorString(err));
+  }
+  macaMemcpy(h_ouput.data(), d_ouput, input_size, macaMemcpyDeviceToHost);
+
+  macaFree(d_input);
+  macaFree(d_weight);
+  macaFree(d_output);
 }
 
+
+static constexpr int FA_BR = 32;   // Q tile size (rows)
+static constexpr int FA_BC = 32;   // KV tile size (columns)
+
+// ============================================================================
+// Device helper: online softmax rescale
+// ============================================================================
+__device__ __forceinline__ float fa_max(float a, float b) { return a > b ? a : b; }
+
+// ============================================================================
+// Flash Attention Kernel
+// Grid:  (ceil(tgt_seq_len / BR), query_heads, batch_size)
+// Block: (BR)  — one thread per Q row in the tile
+// ============================================================================
+template <typename T>
+__global__ void flashAttentionKernel(
+    const T* __restrict__ Q,     // [B, Sq, Hq, D]
+    const T* __restrict__ K,     // [B, Sk, Hkv, D]
+    const T* __restrict__ V,     // [B, Sk, Hkv, D]
+    T*       __restrict__ O,     // [B, Sq, Hq, D]
+    int batch_size,
+    int tgt_seq_len,
+    int src_seq_len,
+    int query_heads,
+    int kv_heads,
+    int head_dim,
+    float scale,                 // 1/sqrt(head_dim)
+    bool is_causal)
+{
+    // ---- Identify this block's work ----
+    const int q_tile_idx  = blockIdx.x;   // which Q tile
+    const int q_head      = blockIdx.y;   // which query head
+    const int b           = blockIdx.z;   // which batch
+
+    const int q_start = q_tile_idx * FA_BR;
+    const int tid     = threadIdx.x;      // 0..BR-1, maps to one Q row
+    const int q_row   = q_start + tid;    // global Q row index
+
+    // GQA: map query head → kv head
+    const int kv_head = q_head / (query_heads / kv_heads);
+
+    // Pointers to this (batch, head) slice
+    // Q layout: [B, Sq, Hq, D] → offset = ((b * Sq + q_row) * Hq + q_head) * D
+    // K layout: [B, Sk, Hkv, D]
+    // V layout: [B, Sk, Hkv, D]
+
+    const int q_stride_b = tgt_seq_len * query_heads * head_dim;
+    const int q_stride_s = query_heads * head_dim;
+
+    const int kv_stride_b = src_seq_len * kv_heads * head_dim;
+    const int kv_stride_s = kv_heads * head_dim;
+
+    const T* Q_base = Q + b * q_stride_b + q_head * head_dim;
+    const T* K_base = K + b * kv_stride_b + kv_head * head_dim;
+    const T* V_base = V + b * kv_stride_b + kv_head * head_dim;
+    T*       O_base = O + b * q_stride_b + q_head * head_dim;
+
+    // ---- Shared memory for KV tiles ----
+    extern __shared__ char smem_raw[];
+    T* s_K = reinterpret_cast<T*>(smem_raw);                  // [BC, head_dim]
+    T* s_V = reinterpret_cast<T*>(smem_raw + FA_BC * head_dim * sizeof(T)); // [BC, head_dim]
+
+    // ---- Registers for this thread's Q row and output accumulator ----
+    // Load Q row into registers
+    float q_reg[256];  // supports head_dim up to 256
+    const int hd = min(head_dim, 256);
+
+    if (q_row < tgt_seq_len) {
+        const T* q_ptr = Q_base + q_row * q_stride_s;
+        for (int d = 0; d < hd; ++d) {
+            q_reg[d] = static_cast<float>(q_ptr[d]);
+        }
+    }
+
+    // Online softmax state
+    float m_i = -1e30f;   // running max
+    float l_i = 0.0f;     // running sum of exp
+    float o_reg[256];     // output accumulator
+    for (int d = 0; d < hd; ++d) o_reg[d] = 0.0f;
+
+    // ---- Determine KV range (causal optimization) ----
+    int kv_end = src_seq_len;
+    if (is_causal && q_row < tgt_seq_len) {
+        // For causal: Q at position q_row can attend to K at positions [0, q_row]
+        // Adjusted for different seq lengths: kv_end = min(src_seq_len, q_row + 1 + src_seq_len - tgt_seq_len)
+        kv_end = min(src_seq_len, q_row + 1 + (src_seq_len - tgt_seq_len));
+        kv_end = max(kv_end, 0);
+    }
+
+    // ---- Loop over KV tiles ----
+    for (int kv_start = 0; kv_start < kv_end; kv_start += FA_BC) {
+        const int kv_tile_size = min(FA_BC, kv_end - kv_start);
+
+        // ---- Cooperatively load K tile into shared memory ----
+        // Total elements: kv_tile_size * head_dim, loaded by BR threads
+        for (int idx = tid; idx < kv_tile_size * head_dim; idx += FA_BR) {
+            int r = idx / head_dim;
+            int c = idx % head_dim;
+            s_K[r * head_dim + c] = K_base[(kv_start + r) * kv_stride_s + c];
+        }
+
+        // ---- Cooperatively load V tile into shared memory ----
+        for (int idx = tid; idx < kv_tile_size * head_dim; idx += FA_BR) {
+            int r = idx / head_dim;
+            int c = idx % head_dim;
+            s_V[r * head_dim + c] = V_base[(kv_start + r) * kv_stride_s + c];
+        }
+        __syncthreads();
+
+        if (q_row >= tgt_seq_len) {
+            __syncthreads();
+            continue;
+        }
+
+        // ---- Compute S = Q_row · K_j for j in [0, kv_tile_size) ----
+        float s_scores[FA_BC];
+        float row_max = -1e30f;
+
+        for (int j = 0; j < kv_tile_size; ++j) {
+            int kv_global = kv_start + j;
+
+            // Causal mask check
+            if (is_causal) {
+                int allowed = q_row + (src_seq_len - tgt_seq_len);
+                if (kv_global > allowed) {
+                    s_scores[j] = -1e30f;
+                    continue;
+                }
+            }
+
+            float dot = 0.0f;
+            for (int d = 0; d < hd; ++d) {
+                dot += q_reg[d] * static_cast<float>(s_K[j * head_dim + d]);
+            }
+            s_scores[j] = dot * scale;
+            row_max = fa_max(row_max, s_scores[j]);
+        }
+
+        // ---- Online softmax update ----
+        float m_new = fa_max(m_i, row_max);
+        float alpha = expf(m_i - m_new);   // rescale factor for old accumulator
+        float row_sum = 0.0f;
+
+        for (int j = 0; j < kv_tile_size; ++j) {
+            s_scores[j] = expf(s_scores[j] - m_new);
+            row_sum += s_scores[j];
+        }
+
+        // Rescale old output and sum
+        l_i = l_i * alpha + row_sum;
+        for (int d = 0; d < hd; ++d) {
+            o_reg[d] *= alpha;
+        }
+
+        // ---- Accumulate O += softmax_weights · V ----
+        for (int j = 0; j < kv_tile_size; ++j) {
+            float w = s_scores[j];
+            for (int d = 0; d < hd; ++d) {
+                o_reg[d] += w * static_cast<float>(s_V[j * head_dim + d]);
+            }
+        }
+
+        m_i = m_new;
+        __syncthreads();
+    }
+
+    // ---- Final normalization: O /= l_i ----
+    if (q_row < tgt_seq_len) {
+        T* o_ptr = O_base + q_row * q_stride_s;
+        float inv_l = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
+        for (int d = 0; d < hd; ++d) {
+            o_ptr[d] = static_cast<T>(o_reg[d] * inv_l);
+        }
+    }
+}
 /**
  * @brief Computes flash attention for given query, key, and value tensors.
  * 
@@ -49,7 +290,63 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
                     int batch_size, int target_seq_len, int src_seq_len, 
                     int query_heads, int kv_heads, int head_dim, bool is_causal) {       
-  // TODO: Implement the flash attention function
+  size_t q_elements = (size_t)batch_size * target_seq_len * query_heads * head_dim;
+    size_t k_elements = (size_t)batch_size * src_seq_len * kv_heads * head_dim;
+    size_t v_elements = k_elements;
+    size_t o_elements = q_elements;
+
+    size_t q_bytes = q_elements * sizeof(T);
+    size_t k_bytes = k_elements * sizeof(T);
+    size_t v_bytes = v_elements * sizeof(T);
+    size_t o_bytes = o_elements * sizeof(T);
+
+    // Allocate device memory
+    T *d_q, *d_k, *d_v, *d_o;
+    macaMalloc(&d_q, q_bytes);
+    macaMalloc(&d_k, k_bytes);
+    macaMalloc(&d_v, v_bytes);
+    macaMalloc(&d_o, o_bytes);
+
+    // H2D copy
+    macaMemcpy(d_q, h_q.data(), q_bytes, macaMemcpyHostToDevice);
+    macaMemcpy(d_k, h_k.data(), k_bytes, macaMemcpyHostToDevice);
+    macaMemcpy(d_v, h_v.data(), v_bytes, macaMemcpyHostToDevice);
+
+    // Kernel configuration
+    float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+
+    dim3 grid(
+        (target_seq_len + FA_BR - 1) / FA_BR,  // Q tiles
+        query_heads,                             // query heads
+        batch_size                               // batch
+    );
+    dim3 block(FA_BR);  // one thread per Q row in tile
+
+    // Shared memory: two KV tiles [BC × head_dim]
+    size_t smem_bytes = 2 * FA_BC * head_dim * sizeof(T);
+
+    flashAttentionKernel<T><<<grid, block, smem_bytes>>>(
+        d_q, d_k, d_v, d_o,
+        batch_size, target_seq_len, src_seq_len,
+        query_heads, kv_heads, head_dim,
+        scale, is_causal
+    );
+
+    // Error check
+    macaError_t err = macaGetLastError();
+    if (err != macaSuccess) {
+        fprintf(stderr, "[FlashAttention] kernel launch error: %s\n",
+                macaGetErrorString(err));
+    }
+
+    // D2H copy
+    macaMemcpy(h_o.data(), d_o, o_bytes, macaMemcpyDeviceToHost);
+
+    // Cleanup
+    macaFree(d_q);
+    macaFree(d_k);
+    macaFree(d_v);
+    macaFree(d_o);
 }
 
 // *********************************************************************

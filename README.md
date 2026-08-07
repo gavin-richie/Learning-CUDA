@@ -181,3 +181,82 @@ make NVCC_DIR=/usr/local/cuda-12.8
 若你的 GPU 不是 RTX 30/40 系列，可用 `make SM_ARCH=sm_89`（RTX 4090）/ `sm_80`（A100）
 之类显式指定。
 测试全部通过（NVIDIA）
+
+编译
+```bash
+echo 'export PATH=/usr/local/cuda-12.8/bin:$PATH' >> ~/.bashrc
+echo 'export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:$LD_LIBRARY_PATH' >> ~/.bashrc
+source ~/.bashrc
+
+make 
+make
+```
+执行结果
+> === Compiling student code (src/kernels.cu ) === \
+> nvcc -std=c++17 -O0 -DPLATFORM_NVIDIA -c src/kernels.cu -o src/kernels.o \
+> nvcc warning : Support for offline compilation for architectures prior to '<compute/sm/lto>_75' will be removed in a future release (Use -Wno-deprecated-gpu-targets to suppress warning).
+> === Linking executable (student code + test logic) === \
+> nvcc -std=c++17 -O0 -DPLATFORM_NVIDIA -o test_kernels src/kernels.o tester/tester_nv.o \
+> nvcc warning : Support for offline compilation for architectures prior to '<compute/sm/lto>_75' will be removed in a future release (Use -Wno-deprecated-gpu-targets to suppress warning). \
+> === Running tests (output from src/kernels.o) === \
+> === Verbose mode: Enabled (using '--verbose') === \
+> ./test_kernels  
+> Testing on device: NVIDIA GeForce RTX 4090 D
+>
+> === rmsNorm Tests === \
+> Test # 1: float  | Verification: Passed \
+> Test # 1: half   | Verification: Passed \
+> Test # 2: float  | Verification: Passed \
+> Test # 2: half   | Verification: Passed
+> Test # 3: float  | Verification: Passed
+> Test # 3: half   | Verification: Passed
+> Test # 4: float  | Verification: Passed
+> Test # 4: half   | Verification: Passed
+> Test # 5: float  | Verification: Passed
+> Test # 5: half   | Verification: Passed
+> Test # 6: float  | Verification: Passed
+> Test # 6: half   | Verification: Passed
+> Test # 7: float  | Verification: Passed
+> Test # 7: half   | Verification: Passed
+> Test # 8: float  | Verification: Passed
+> Test # 8: half   | Verification: Passed
+> Test # 9: float  | Verification: Passed
+> Test # 9: half   | Verification: Passed
+> Test #10: float  | Verification: Passed
+> Test #10: half   | Verification: Passed
+> Test #11: float  | Verification: Passed
+> Test #11: half   | Verification: Passed
+> Test #12: float  | Verification: Passed
+> Test #12: half   | Verification: Passed
+> Test #13: float  | Verification: Passed
+> Test #13: half   | Verification: Passed
+>
+> === Attention Tests ===
+> Test # 1: float  | Verification: Passed
+> Test # 1: half   | Verification: Passed
+> Test # 2: float  | Verification: Passed
+> Test # 2: half   | Verification: Passed
+> Test # 3: float  | Verification: Passed
+> Test # 3: half   | Verification: Passed
+> Test # 4: float  | Verification: Passed
+> Test # 4: half   | Verification: Passed
+> Test # 5: float  | Verification: Passed
+> Test # 5: half   | Verification: Passed
+> Test # 6: float  | Verification: Failed \
+> Test # 6: half   | Verification: Passed
+> Test # 7: float  | Verification: Passed
+> Test # 7: half   | Verification: Passed
+> Test # 8: float  | Verification: Passed
+> Test # 8: half   | Verification: Passed
+> Test # 9: float  | Verification: Passed
+> Test # 9: half   | Verification: Passed
+> Test #10: float  | Verification: Passed
+> Test #10: half   | Verification: Passed
+> Test #11: float  | Verification: Passed
+> Test #11: half   | Verification: Passed
+> Test #12: float  | Verification: Passed
+> Test #12: half   | Verification: Passed
+> Test #13: float  | Verification: Passed
+> Test #13: half   | Verification: Passed
+> Test #14: float  | Verification: Failed \
+> Test #14: half   | Verification: Passed
