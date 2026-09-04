@@ -1,6 +1,7 @@
 # 总结报告：MXFP8 / NVFP4 低精度软件模拟与反量化
 
-作者：gavin-richie ｜ 目标 GPU：RTX 4060 (Ada, sm_89) ｜ CUDA 12.6
+作者：gavin-richie ｜ 开发 GPU：RTX 4060 (Ada, sm_89) ｜ CUDA 12.6
+验证 GPU：RTX 4090 D (Ada, sm_89) ｜ CUDA 12.8（NGC 25.01 容器，原生 Linux）
 
 ## 1. 低精度格式与缩放策略
 
@@ -94,6 +95,52 @@ E5M2 与 E4M3 走同一 kernel，仅 vmax 与解码常量不同。
 （4060 Laptop 理论 ≈ 272 GB/s）。量化 kernel 因每 block 先做串行 amax
 归约（32/16 次全局读），带宽低于反量化，是后续优化点。
 
+### 4.1 RTX 4090 D 复测（同 4096×4096 fp32 输入、fp16 输出、seed=42）
+
+误差与 4060 **逐位一致**——6 组 max abs / MAE / MSE 全部相同，量化数学
+与架构无关得到实证。性能对照（cudaEvent 计时，同口径 `(输入 4B +
+压缩后字节)/时间`）：
+
+| 格式 | 指标 | 4060 Laptop (≈272 GB/s) | 4090 D (≈1008 GB/s) | 提升 |
+|---|---|---|---|---|
+| MXFP8 | 量化 GB/s | 58 | 178 | 3.0× |
+| MXFP8 | 反量化 GB/s | 162 | 767 | 4.7× |
+| NVFP4 | 量化 GB/s | 182 | 750 | 4.1× |
+| NVFP4 | 反量化 GB/s | 246 | 1089 | 4.4× |
+
+- 4090 D 反量化带宽超过显存规格峰值（1089–1167 GB/s > 1008 GB/s）：
+  64 MB 张量整体驻留该卡 72 MB L2，读命中 L2 所致（outlier 分布最高
+  1167 GB/s）。
+- 量化 kernel 的串行 amax 归约在两代卡上都是瓶颈（仅 178–750 GB/s），
+  与 4060 上的结论一致，仍为首要优化点。
+- 完整日志见 `artifacts/4090d/log_*.txt`，nsys 时间线见
+  `artifacts/4090d/profile_{mxfp8,nvfp4}/`（nsys 捕获的
+  quant/dequant/metrics kernel 耗时与 cudaEvent 计时一致）。
+
+### 4.2 Transformer Engine 对比（per-tensor FP8，RTX 4090 D）
+
+容器预装 TransformerEngine 1.14，仅有 DelayedScaling/CurrentScaling
+per-tensor recipe；MXFP8/NVFP4 block-scaling recipe 需要 TE ≥ 2.0 且
+Blackwell（sm_100）硬件，本卡无法运行。用 `scripts/te_compare.py` 走
+TE 的 `Float8Tensor.quantize_` / `dequantize` cast kernel（E4M3、fp16
+输出、与软件路径同误差/带宽口径）：
+
+| 分布 | TE max abs | TE MAE | 软件 MXFP8 MAE | TE 压缩率 | TE 量化/反量化 ms | 软件量化/反量化 ms |
+|---|---|---|---|---|---|---|
+| normal | 0.1911 | 0.0180 | 0.0180 | 4.00 | 0.270 / 0.032 | 0.475 / 0.110 |
+| random | 0.3605 | 0.1105 | 0.1167 | 4.00 | 0.270 / 0.032 | 0.473 / 0.111 |
+| outlier | 17.95 | 0.0114 | 0.0106 | 4.00 | 0.270 / 0.032 | 0.475 / 0.112 |
+
+- 误差：normal 下 TE per-tensor 与软件 block-scale 几乎一致；outlier 下
+  软件 block scaling 的 max abs（16.0 vs 17.95）与 MAE 均略优——块级
+  缩放把离群点的影响隔离在所在 32 元素块内；软件压缩率 3.88 略低于
+  TE 的 4.00（含 block scale 开销）。
+- 吞吐：TE dequant kernel 约为软件实现的 3.4×（2592 vs 767 GB/s，同口径
+  公式），quantize（含 amax/scale 归约）约 1.8×。差距主要来自 TE cast
+  kernel 的向量化程度，正是第 8 节优化项的预期空间。
+- MXFP8/NVFP4 recipe 的硬件对照待 Blackwell + TE ≥ 2.0 补做，
+  `te_compare.py` 已为此预留 `--format` 扩展点。
+
 ## 5. 软件模拟与硬件路径边界
 
 - **全部数值编解码（E4M3/E5M2/E2M1/E8M0）、打包、缩放、反量化均为纯软件
@@ -101,10 +148,11 @@ E5M2 与 E4M3 走同一 kernel，仅 vmax 与解码常量不同。
   无 FP8/FP4 Tensor Core、无 Hopper/Blackwell/Ampere+ 专属指令，可在任意
   sm_60+ GPU（含 4060）运行。
 - CUDA Math API（`__nv_cvt_float_to_fp8` 等）与 Transformer Engine 硬件
-  加速路径属于**加分项**，本基础版本未启用；CMake 预留
-  `ENABLE_TE_COMPARISON` 开关，待在 3090（Ampere）/H20（Hopper）/5090
-  （Blackwell）上补充对比。届时只需换 `-DCMAKE_CUDA_ARCHITECTURES=
-  86/90/120` 重编，kernel 代码无需修改。
+  加速路径属于**加分项**。TE 对比已在 RTX 4090 D 完成 per-tensor FP8
+  路径（见 4.2 节，`scripts/te_compare.py`，不改 C++ 代码）；CMake 的
+  `ENABLE_TE_COMPARISON` 开关注释已指向该脚本。MXFP8/NVFP4 block-scaling
+  recipe 的硬件对照需 TE ≥ 2.0 + Blackwell，届时换
+  `-DCMAKE_CUDA_ARCHITECTURES=120` 重编即可，kernel 代码无需修改。
 - 测试覆盖：编解码单元测试（含 0/饱和/次正规/中点偶数/NaN/全码空间往返）、
   文件 IO 往返、GPU 与 CPU 参考实现逐位一致的 roundtrip 测试（含奇数尾块、
   tensor/block × nearest/stochastic 组合）。
@@ -117,9 +165,20 @@ E5M2 与 E4M3 走同一 kernel，仅 vmax 与解码常量不同。
   Windows 宿主机安装的 Nsight Systems / Nsight Compute GUI 中直接
   File→Open 打开分析，不依赖生成平台；只需保证 Windows 端软件版本 ≥
   采集端版本（建议均装最新版），文件通过共享目录/网络复制即可。
-- 本开发环境为 WSL2，ncu 无法访问 GPU 性能计数器
-  （`ERR_NVGPUCTRPERM`，WSL 驱动层限制），脚本自动跳过并留日志；在原生
-  Linux 或按 ERR_NVGPUCTRPERM 文档配置权限后即可采集 `--set full` 报告。
+- ncu 计数器在两套环境都不可用，但根因不同、脚本处理一致：WSL2 是驱动
+  层限制；4090 D 容器是宿主机驱动 `RmProfilingAdminOnly=1` 且容器未授予
+  `CAP_SYS_ADMIN`（uid=0 也无效）。需在宿主机执行
+  `modprobe nvidia NVreg_RestrictProfilingToAdminUsers=0`，或以
+  `--cap-add SYS_ADMIN`（配合 `--security-opt seccomp=unconfined`）启动
+  容器后方可采集。`profile.sh` 将 `ERR_NVGPUCTRPERM` 识别为"跳过"而非
+  失败，并保留日志。
+- nsys 时间线已在 4090 D（原生 Linux 容器，Nsight Systems 2024.6.2）
+  采集：`artifacts/4090d/profile_{mxfp8,nvfp4}/*.nsys-rep`。
+- `profile.sh` 现产出五类文件（`.ncu-rep` / `_ncu_summary.txt` /
+  `_ncu.log` / `.nsys-rep` / `_nsys_stats.txt`），对"ncu 未安装 /
+  计数器无权限 / 其他失败"三种情况分别处理（跳过 / 跳过 / 报错退出）；
+  kernel 过滤放宽为 `regex:quant|dequant|amax|metrics` 覆盖全部 6 个
+  kernel。
 
 ## 7. 开发中发现的问题
 
@@ -128,15 +187,22 @@ E5M2 与 E4M3 走同一 kernel，仅 vmax 与解码常量不同。
    （decode→encode 稳定性）暴露后修正。
 2. `frexpf` 的第二个参数传 `nullptr` 会在运行期崩溃——E8M0 ceil 编码需要
    同时取尾数判断"恰为 2 的幂"，必须用真实指针。
-3. WSL2 下 ncu 计数器不可用（见上），这也是把"报告文件跨平台打开"作为
-   分析路径的原因。
+3. WSL2 与 4090 D 容器下 ncu 计数器均不可用（根因不同，见第 6 节），
+   这也是把"报告文件跨平台打开"作为分析路径的原因。
+4. 定制版 TE 1.14 直接调 `tex.cast_to_fp8(..., scaling_mode)` 会在
+   `CheckScaleTensor` 处整数除零崩溃（SIGFPE）；改走
+   `Float8Tensor.quantize_(x, scale=, amax=)` 封装层正常。此外
+   `ncu --import | head` 这类"长输出管道接 head"在 `set -o pipefail`
+   脚本里会因 SIGPIPE（退出码 141）杀死整个脚本——先落盘再用 `head`
+   截断显示才安全。
 
 ## 8. 未来工作
 
 - 量化 kernel 的块内 amax 改为 warp shuffle 归约 + 每线程多 block（提高
   带宽利用率）；NVFP4 反量化改 `uint4`（16B=32 元素）向量化 packed load。
-- 在 5090 上增加 Transformer Engine / 硬件 FP8 路径对比，量化误差与吞吐
-  对照；评估 `__nv_fp4` 内建与本模拟的一致性。
+- TE per-tensor FP8 对比已完成（4.2 节）；待 Blackwell GPU + TE ≥ 2.0
+  补 MXFP8/NVFP4 block-scaling recipe 的误差/吞吐对照，并评估
+  `__nv_fp4` 内建与本模拟的一致性。
 - 3090/4090/H20 多架构带宽标定，验证 kernel 的架构无关性。
 - 国产平台（metax/moore/iluvatar）移植：kernel 仅用 CUDA C++ 基础特性，
   适配工作主要在 RUNTIME 宏层（参考仓库 master 分支 tester 抽象）。

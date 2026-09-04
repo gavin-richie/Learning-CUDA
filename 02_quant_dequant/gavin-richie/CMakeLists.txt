@@ -39,5 +39,6 @@ lowp_test(test_io)
 lowp_test(test_roundtrip)
 
 # Optional hardware-accelerated comparison path (Transformer Engine, etc.).
-# Not required for base acceptance; enable on Hopper/Blackwell machines.
+# The Python comparison lives in scripts/te_compare.py (no C++ changes
+# needed); this switch stays reserved for a future C++ TE linkage.
 option(ENABLE_TE_COMPARISON "Build Transformer Engine comparison path" OFF)

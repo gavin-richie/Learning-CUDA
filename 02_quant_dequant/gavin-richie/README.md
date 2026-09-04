@@ -8,13 +8,14 @@
 需要 CUDA Toolkit >= 11.5（建议 12.x）、CMake >= 3.18。
 
 ```bash
-cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=89   # 4060/4090 (Ada)
+cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=89   # 4060/4090(D) (Ada)
 cmake --build build -j
 cd build && ctest          # 单元测试 + GPU roundtrip 测试
 ```
 
 架构对照：3090=86，4060/4090=89，H20=90，5090=120。
-默认 `CMAKE_CUDA_ARCHITECTURES=89`。
+默认 `CMAKE_CUDA_ARCHITECTURES=89`（已在 RTX 4060 与 RTX 4090 D 上验证，
+两者同为 sm_89，误差结果逐位一致）。
 
 ## 运行
 
@@ -59,8 +60,20 @@ scripts/profile.sh ./build/lowp artifacts/t.bin q.txt artifacts/prof
 
 生成的 `.nsys-rep` / `.ncu-rep` 是跨平台文件，可直接在 Windows 宿主机上用
 Nsight Systems / Nsight Compute GUI 打开（GUI 版本需 >= 采集端 CLI 版本）。
-注意 WSL2 环境下 ncu 无法访问 GPU 性能计数器（ERR_NVGPUCTRPERM），
-脚本会自动跳过并记录日志；nsys 时间线不受影响。
+注意：WSL2 与未授权容器中 ncu 无法访问 GPU 性能计数器（`ERR_NVGPUCTRPERM`，
+容器场景通常是宿主机驱动 `RmProfilingAdminOnly=1` 且未授予
+`CAP_SYS_ADMIN`），脚本会识别为"跳过"并记录日志；nsys 时间线不受影响。
+
+## Transformer Engine 对比（可选）
+
+```bash
+python3 scripts/te_compare.py artifacts/t4096_normal.bin --dist normal \
+    --out artifacts/log_te_e4m3_normal.txt
+```
+
+用预装 TransformerEngine 的 per-tensor FP8 cast kernel 跑同一张量，
+输出与 `lowp run --log` 同口径的误差/带宽日志（MXFP8/NVFP4 block-scaling
+recipe 需 TE >= 2.0 + Blackwell）。
 
 ## 目录
 
@@ -69,6 +82,8 @@ Nsight Systems / Nsight Compute GUI 打开（GUI 版本需 >= 采集端 CLI 版�
 - `src/file_io.cpp` — 张量/参数/权重文件 IO
 - `src/main.cu` — CLI
 - `tests/` — 编解码单元测试、文件 IO 测试、GPU roundtrip 测试
-- `artifacts/` — 样例日志与 nsys 报告
+- `scripts/te_compare.py` — Transformer Engine per-tensor FP8 对比
+- `artifacts/` — 样例日志与 nsys 报告（`artifacts/4090d/` 为 RTX 4090 D
+  复测结果）
 
 详细设计与结果分析见 `REPORT.md`。
