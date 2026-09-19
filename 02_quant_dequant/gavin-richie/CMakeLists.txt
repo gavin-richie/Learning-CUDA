@@ -42,3 +42,28 @@ lowp_test(test_roundtrip)
 # The Python comparison lives in scripts/te_compare.py (no C++ changes
 # needed); this switch stays reserved for a future C++ TE linkage.
 option(ENABLE_TE_COMPARISON "Build Transformer Engine comparison path" OFF)
+
+# Optional check that the software codecs are bit-identical to the CUDA Math
+# API conversion intrinsics (cuda_fp8.h / cuda_fp4.h). On Blackwell these map
+# to the native cvt instructions, which only exist in arch-specific builds:
+# the target rewrites e.g. 120 -> 120a. Needs CUDA >= 12.8 (cuda_fp4.h).
+option(ENABLE_NATIVE_CVT_TEST
+  "Build test_native_cvt (software codecs vs __nv_cvt intrinsics)" OFF)
+if(ENABLE_NATIVE_CVT_TEST)
+  if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 12.8)
+    message(FATAL_ERROR "ENABLE_NATIVE_CVT_TEST needs CUDA >= 12.8 (cuda_fp4.h)")
+  endif()
+  set(NATIVE_TEST_ARCHS "")
+  foreach(a ${CMAKE_CUDA_ARCHITECTURES})
+    if(a MATCHES "^[0-9]+$" AND a GREATER_EQUAL 100)
+      list(APPEND NATIVE_TEST_ARCHS "${a}a")
+    else()
+      list(APPEND NATIVE_TEST_ARCHS "${a}")
+    endif()
+  endforeach()
+  add_executable(test_native_cvt tests/test_native_cvt.cu)
+  target_link_libraries(test_native_cvt PRIVATE lowp_core)
+  set_target_properties(test_native_cvt PROPERTIES
+    CUDA_ARCHITECTURES "${NATIVE_TEST_ARCHS}")
+  add_test(NAME test_native_cvt COMMAND test_native_cvt)
+endif()
