@@ -8,7 +8,7 @@
 // instructions are used anywhere; everything below is plain integer/float
 // arithmetic that runs on any CUDA GPU (and on the host for reference tests).
 //
-//   E4M3 : 4 exponent bits, 3 mantissa bits, no inf, NaN = 0x7F/0xFF,
+//   E4M3 : 4 exponent bits, 3 mantissa bits, no inf, NaN = 0xF7,
 //          max finite value +/-448 (OCP MX spec).
 //   E5M2 : 5 exponent bits, 2 mantissa bits, IEEE-style inf/NaN,
 //          max finite value +/-57344.
